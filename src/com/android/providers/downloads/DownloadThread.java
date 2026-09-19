@@ -59,6 +59,8 @@ import android.content.Intent;
 import android.drm.DrmManagerClient;
 import android.drm.DrmOutputStream;
 import android.net.INetworkPolicyListener;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkPolicyManager;
@@ -460,6 +462,8 @@ public class DownloadThread extends Thread {
                 // Check that the caller is allowed to make network connections. If so, make one on
                 // their behalf to open the url.
                 checkConnectivity();
+                final boolean policyRouting = usePolicyRouting();
+                if (policyRouting) logDebug("Using policy routing for shared split VPN");
                 if (downloadViaPlatformHttpEngine() && !mSystemFacade.hasPerDomainConfig(
                         mInfo.mPackage)) {
                     // Disable HttpEngine if the caller APK has a per-domain networkConfig as this
@@ -468,13 +472,14 @@ public class DownloadThread extends Thread {
                     // in the future.
                     mHttpEngine = new HttpEngine.Builder(mContext).build();
                     logDebug("HttpEngine is being used for this download");
-                    mHttpEngine.bindToNetwork(mNetwork);
+                    if (!policyRouting) mHttpEngine.bindToNetwork(mNetwork);
                     conn = (HttpURLConnection) mHttpEngine.openConnection(url);
                 } else {
                     // HttpEngine does not support setConnectTimeout on its HttpUrlConnection
                     // implementation. The default timeout in HttpEngine is 4 minutes which is much
                     // longer than what's defined here but that should not be a problem.
-                    conn = (HttpURLConnection) mNetwork.openConnection(url);
+                    conn = (HttpURLConnection) (policyRouting
+                            ? url.openConnection() : mNetwork.openConnection(url));
                     conn.setConnectTimeout(DEFAULT_TIMEOUT);
                 }
                 conn.setInstanceFollowRedirects(false);
@@ -750,9 +755,32 @@ public class DownloadThread extends Thread {
         }
     }
 
-    /**
-     * Check if current connectivity is valid for this request.
-     */
+    private boolean usePolicyRouting() {
+        final ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
+        return shouldUsePolicyRouting(mNetwork, cm.getNetworkCapabilities(mNetwork),
+                cm.getLinkProperties(mNetwork), cm.getActiveNetwork(),
+                cm.getBoundNetworkForProcess(), cm.getDefaultProxy() != null);
+    }
+
+    // Package-visible for the split-VPN decision regression check.
+    static boolean shouldUsePolicyRouting(Network assigned, NetworkCapabilities caps,
+            LinkProperties links, Network worker, Network processBound,
+            boolean hasProxy) {
+        if (assigned != null && caps != null && links != null
+                && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                && !links.hasIpv4DefaultRoute() && !links.hasIpv6DefaultRoute()
+                && assigned.equals(worker) && processBound == null
+                && !hasProxy && links.getHttpProxy() == null) {
+            // JobScheduler supplies the requester's default network (scheduleAsPackage).
+            // An explicitly bound split VPN has no route to public destinations. Unbound
+            // sockets use kernel VPN/policy routing, NOT protection or cellular binding.
+            // Keep mNetwork unchanged for job constraints and re-evaluate on every redirect.
+            return true;
+        }
+        return false;
+    }
+
+    /** Check if current connectivity is valid for this request. */
     private void checkConnectivity() throws StopRequestException {
         // checking connectivity will apply current policy
         mPolicyDirty = false;
